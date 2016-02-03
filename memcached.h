@@ -20,6 +20,7 @@
 
 #include "protocol_binary.h"
 #include "cache.h"
+#include "shadow_assoc.h"
 
 #include "sasl_defs.h"
 
@@ -68,7 +69,7 @@
  * in this many seconds. That saves us from churning on frequently-accessed
  * items.
  */
-#define ITEM_UPDATE_INTERVAL 60
+#define ITEM_UPDATE_INTERVAL 0
 
 /* unistd.h is here */
 #if HAVE_UNISTD_H
@@ -219,6 +220,7 @@ typedef unsigned int rel_time_t;
 struct slab_stats {
     uint64_t  set_cmds;
     uint64_t  get_hits;
+    uint64_t  shadowq_hits;
     uint64_t  touch_hits;
     uint64_t  delete_hits;
     uint64_t  cas_hits;
@@ -267,6 +269,7 @@ struct stats {
     uint64_t      set_cmds;
     uint64_t      touch_cmds;
     uint64_t      get_hits;
+    uint64_t      shadowq_hits;
     uint64_t      get_misses;
     uint64_t      touch_hits;
     uint64_t      touch_misses;
@@ -314,6 +317,7 @@ struct settings {
     enum protocol binding_protocol;
     int backlog;
     int item_size_max;        /* Maximum item size, and upper end for slabs */
+    int shadowq_size;         /* Shadowq size */
     bool sasl;              /* SASL on/off */
     bool maxconns_fast;     /* Whether or not to early close connections */
     bool lru_crawler;        /* Whether or not to enable the autocrawler thread */
@@ -593,6 +597,8 @@ void append_stat(const char *name, ADD_STAT add_stats, conn *c,
                  const char *fmt, ...);
 
 enum store_item_type store_item(item *item, int comm, conn *c);
+
+shadow_item* create_shadow_item(item *it);
 
 #if HAVE_DROP_PRIVILEGES
 extern void drop_privileges(void);

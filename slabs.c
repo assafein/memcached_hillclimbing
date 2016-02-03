@@ -37,6 +37,13 @@ typedef struct {
 
     unsigned int killing;  /* index+1 of dying slab, or zero if none */
     size_t requested; /* The number of requested bytes */
+
+/*** shadow queue Additions ***/
+    shadow_item *shadowq_head;
+    shadow_item *shadowq_tail;
+    unsigned int shadowq_size;
+    int shadowq_hits;
+    uint32_t shadowq_max_items;
 } slabclass_t;
 
 static slabclass_t slabclass[MAX_NUMBER_OF_SLAB_CLASSES];
@@ -47,6 +54,8 @@ static int power_largest;
 static void *mem_base = NULL;
 static void *mem_current = NULL;
 static size_t mem_avail = 0;
+static int prev_victim = POWER_SMALLEST;
+static int slab_shadowq_dec_victim = POWER_SMALLEST;
 
 /**
  * Access to the slab allocator is protected by this lock
@@ -119,6 +128,8 @@ void slabs_init(const size_t limit, const double factor, const bool prealloc) {
 
         slabclass[i].size = size;
         slabclass[i].perslab = settings.item_size_max / slabclass[i].size;
+        slabclass[i].shadowq_max_items = settings.shadowq_size / slabclass[i].size;
+        printf("shadowq_max_items: queue %d, slab_size %d, perslab %d, shadowq_size %d\n",i,size,slabclass[i].perslab, slabclass[i].shadowq_max_items);
         size *= factor;
         if (settings.verbose > 1) {
             fprintf(stderr, "slab class %3d: chunk size %9u perslab %7u\n",
@@ -343,6 +354,8 @@ static void do_slabs_stats(ADD_STAT add_stats, void *c) {
                             (unsigned long long)p->requested);
             APPEND_NUM_STAT(i, "get_hits", "%llu",
                     (unsigned long long)thread_stats.slab_stats[i].get_hits);
+            APPEND_NUM_STAT(i, "shadowq_hits", "%llu",
+                    (unsigned long long)thread_stats.slab_stats[i].shadowq_hits);
             APPEND_NUM_STAT(i, "cmd_set", "%llu",
                     (unsigned long long)thread_stats.slab_stats[i].set_cmds);
             APPEND_NUM_STAT(i, "delete_hits", "%llu",
@@ -861,6 +874,7 @@ int start_slab_maintenance_thread(void) {
         fprintf(stderr, "Can't create slab maint thread: %s\n", strerror(ret));
         return -1;
     }
+    
     if ((ret = pthread_create(&rebalance_tid, NULL,
                               slab_rebalance_thread, NULL)) != 0) {
         fprintf(stderr, "Can't create rebal thread: %s\n", strerror(ret));
@@ -868,6 +882,20 @@ int start_slab_maintenance_thread(void) {
     }
     return 0;
 }
+
+int start_slab_rebalance_thread(void) {
+    int ret;
+    slab_rebalance_signal = 0;
+    slab_rebal.slab_start = NULL;
+
+    if ((ret = pthread_create(&rebalance_tid, NULL,
+                          slab_rebalance_thread, NULL)) != 0) {
+        fprintf(stderr, "Can't create rebal thread: %s\n", strerror(ret));
+        return -1;
+    }
+    return 0;
+}
+
 
 void stop_slab_maintenance_thread(void) {
     mutex_lock(&cache_lock);
@@ -880,3 +908,54 @@ void stop_slab_maintenance_thread(void) {
     pthread_join(maintenance_tid, NULL);
     pthread_join(rebalance_tid, NULL);
 }
+
+void stop_slab_rebalance_thread(void) {
+    mutex_lock(&cache_lock);
+    do_run_slab_thread = 0;
+    do_run_slab_rebalance_thread = 0;
+    pthread_cond_signal(&maintenance_cond);
+    pthread_mutex_unlock(&cache_lock);
+    pthread_join(rebalance_tid, NULL);
+}
+
+
+shadow_item* slabs_shadowq_lookup(char *key, const size_t nkey) {
+    uint32_t hv = hash(key, nkey);
+    shadow_item* shadow_it = shadow_assoc_find(key, nkey, hv);
+    if (shadow_it) {
+        //move to head
+        remove_shadowq_item(shadow_it);
+        insert_shadowq_item(shadow_it, shadow_it->slabs_clsid);
+
+        //update shadowq hit counters
+        do {
+            slab_shadowq_dec_victim = ((slab_shadowq_dec_victim + 1 - POWER_SMALLEST) % (power_largest - POWER_SMALLEST + 1)) + POWER_SMALLEST; //round robin
+        } while (slab_shadowq_dec_victim == shadow_it->slabs_clsid);
+        slabclass[slab_shadowq_dec_victim].shadowq_hits--;
+        slabclass[shadow_it->slabs_clsid].shadowq_hits++;
+
+        //Slab rebalance
+        if ((slabclass[shadow_it->slabs_clsid].shadowq_hits) > SHADOWQ_HIT_THRESHOLD) {
+            int counter = 0; //make sure we are not stuck in case there are no more slabs left
+            do {
+                if (counter++ > power_largest - POWER_SMALLEST + 1)
+                    break;
+                prev_victim = ((prev_victim + 1 - POWER_SMALLEST) % (power_largest - POWER_SMALLEST + 1)) + POWER_SMALLEST; //round robin
+            } while ((prev_victim == shadow_it->slabs_clsid) || (slabclass[prev_victim].slabs <= 1));
+
+            printf("Signaled REASSIGN %d TO %d\n", prev_victim, shadow_it->slabs_clsid);
+            slabclass[shadow_it->slabs_clsid].shadowq_hits = 0; 
+            do_slabs_reassign(prev_victim,shadow_it->slabs_clsid);
+        }
+    }
+    return shadow_it;
+}
+
+shadow_item* get_shadowq_head(unsigned int id) { return (slabclass[id].shadowq_head); }
+void set_shadowq_head(shadow_item *elem, unsigned int id) { slabclass[id].shadowq_head = elem; }
+shadow_item* get_shadowq_tail(unsigned int id) { return (slabclass[id].shadowq_tail); }
+void set_shadowq_tail(shadow_item *elem, unsigned int id) { slabclass[id].shadowq_tail = elem; }
+unsigned int get_shadowq_max_items(unsigned int id) { return (slabclass[id].shadowq_max_items); }
+unsigned int get_shadowq_size(unsigned int id) { return (slabclass[id].shadowq_size); }
+void dec_shadowq_size(unsigned int id) { slabclass[id].shadowq_size--; }
+void inc_shadowq_size(unsigned int id) { slabclass[id].shadowq_size++; }

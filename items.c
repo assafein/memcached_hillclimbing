@@ -182,6 +182,12 @@ item *do_item_alloc(char *key, const size_t nkey, const int flags,
                 if ((search->it_flags & ITEM_FETCHED) == 0) {
                     itemstats[id].evicted_unfetched++;
                 }
+
+                shadow_item* new_shadow_it = create_shadow_item(search);
+                hv = hash(new_shadow_it->key, new_shadow_it->nkey);
+                shadow_assoc_insert(new_shadow_it, hv); 
+                insert_shadowq_item(new_shadow_it,new_shadow_it->slabs_clsid);
+
                 it = search;
                 slabs_adjust_mem_requested(it->slabs_clsid, ITEM_ntotal(it), ntotal);
                 do_item_unlink_nolock(it, hv);

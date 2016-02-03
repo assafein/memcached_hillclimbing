@@ -675,6 +675,7 @@ void threadlocal_stats_reset(void) {
         for(sid = 0; sid < MAX_NUMBER_OF_SLAB_CLASSES; sid++) {
             threads[ii].stats.slab_stats[sid].set_cmds = 0;
             threads[ii].stats.slab_stats[sid].get_hits = 0;
+            threads[ii].stats.slab_stats[sid].shadowq_hits = 0;
             threads[ii].stats.slab_stats[sid].touch_hits = 0;
             threads[ii].stats.slab_stats[sid].delete_hits = 0;
             threads[ii].stats.slab_stats[sid].incr_hits = 0;
@@ -717,6 +718,8 @@ void threadlocal_stats_aggregate(struct thread_stats *stats) {
                 threads[ii].stats.slab_stats[sid].set_cmds;
             stats->slab_stats[sid].get_hits +=
                 threads[ii].stats.slab_stats[sid].get_hits;
+            stats->slab_stats[sid].shadowq_hits +=
+                threads[ii].stats.slab_stats[sid].shadowq_hits;
             stats->slab_stats[sid].touch_hits +=
                 threads[ii].stats.slab_stats[sid].touch_hits;
             stats->slab_stats[sid].delete_hits +=
@@ -740,6 +743,7 @@ void slab_stats_aggregate(struct thread_stats *stats, struct slab_stats *out) {
 
     out->set_cmds = 0;
     out->get_hits = 0;
+    out->shadowq_hits = 0;
     out->touch_hits = 0;
     out->delete_hits = 0;
     out->incr_hits = 0;
@@ -750,6 +754,7 @@ void slab_stats_aggregate(struct thread_stats *stats, struct slab_stats *out) {
     for (sid = 0; sid < MAX_NUMBER_OF_SLAB_CLASSES; sid++) {
         out->set_cmds += stats->slab_stats[sid].set_cmds;
         out->get_hits += stats->slab_stats[sid].get_hits;
+        out->shadowq_hits += stats->slab_stats[sid].shadowq_hits;
         out->touch_hits += stats->slab_stats[sid].touch_hits;
         out->delete_hits += stats->slab_stats[sid].delete_hits;
         out->decr_hits += stats->slab_stats[sid].decr_hits;

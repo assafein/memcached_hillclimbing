@@ -173,7 +173,7 @@ static rel_time_t realtime(const time_t exptime) {
 
 static void stats_init(void) {
     stats.curr_items = stats.total_items = stats.curr_conns = stats.total_conns = stats.conn_structs = 0;
-    stats.get_cmds = stats.set_cmds = stats.get_hits = stats.get_misses = stats.evictions = stats.reclaimed = 0;
+    stats.get_cmds = stats.set_cmds = stats.get_hits = stats.get_misses = stats.evictions = stats.reclaimed = stats.shadowq_hits = 0;
     stats.touch_cmds = stats.touch_misses = stats.touch_hits = stats.rejected_conns = 0;
     stats.malloc_fails = 0;
     stats.curr_bytes = stats.listen_disabled_num = 0;
@@ -229,6 +229,7 @@ static void settings_init(void) {
     settings.backlog = 1024;
     settings.binding_protocol = negotiating_prot;
     settings.item_size_max = 1024 * 1024; /* The famous 1MB upper limit. */
+    settings.shadowq_size = 1024 * 1024; /* 1MB */
     settings.maxconns_fast = false;
     settings.lru_crawler = false;
     settings.lru_crawler_sleep = 100;
@@ -1349,6 +1350,10 @@ static void process_bin_get_or_touch(conn *c) {
         }
         pthread_mutex_unlock(&c->thread->stats.mutex);
 
+        shadow_item* shadow_it = slabs_shadowq_lookup(key,nkey); //FIXME - redundat lookup, delete in overhead measurments
+
+        if (shadow_it)
+            c->thread->stats.slab_stats[shadow_it->slabs_clsid].shadowq_hits++;
         if (should_touch) {
             MEMCACHED_COMMAND_TOUCH(c->sfd, key, nkey, -1, 0);
         } else {
@@ -2381,9 +2386,13 @@ enum store_item_type do_store_item(item *it, int comm, conn *c, const uint32_t h
         if (stored == NOT_STORED) {
             if (old_it != NULL)
                 item_replace(old_it, it, hv);
-            else
+            else {
+                shadow_item* shadow_it = shadow_assoc_find(key, it->nkey, hv);
+                if (shadow_it != NULL) {
+                    evict_shadowq_item(shadow_it);
+                }
                 do_item_link(it, hv);
-
+            }
             c->cas = ITEM_get_cas(it);
 
             stored = STORED;
@@ -2589,6 +2598,7 @@ static void server_stats(ADD_STAT add_stats, conn *c) {
     APPEND_STAT("cmd_flush", "%llu", (unsigned long long)thread_stats.flush_cmds);
     APPEND_STAT("cmd_touch", "%llu", (unsigned long long)thread_stats.touch_cmds);
     APPEND_STAT("get_hits", "%llu", (unsigned long long)slab_stats.get_hits);
+    APPEND_STAT("shadowq_hits", "%llu", (unsigned long long)slab_stats.shadowq_hits);
     APPEND_STAT("get_misses", "%llu", (unsigned long long)thread_stats.get_misses);
     APPEND_STAT("delete_misses", "%llu", (unsigned long long)thread_stats.delete_misses);
     APPEND_STAT("delete_hits", "%llu", (unsigned long long)slab_stats.delete_hits);
@@ -2652,6 +2662,7 @@ static void process_stat_settings(ADD_STAT add_stats, void *c) {
                 prot_text(settings.binding_protocol));
     APPEND_STAT("auth_enabled_sasl", "%s", settings.sasl ? "yes" : "no");
     APPEND_STAT("item_size_max", "%d", settings.item_size_max);
+    APPEND_STAT("shadowq_size", "%d", settings.shadowq_size);
     APPEND_STAT("maxconns_fast", "%s", settings.maxconns_fast ? "yes" : "no");
     APPEND_STAT("hashpower_init", "%d", settings.hashpower_init);
     APPEND_STAT("slab_reassign", "%s", settings.slab_reassign ? "yes" : "no");
@@ -2983,6 +2994,11 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
                 c->thread->stats.get_misses++;
                 c->thread->stats.get_cmds++;
                 pthread_mutex_unlock(&c->thread->stats.mutex);
+
+                shadow_item* shadow_it = slabs_shadowq_lookup(key,nkey); //FIXME - redundat lookup, delete in overhead measurments 
+                if (shadow_it)
+                    c->thread->stats.slab_stats[shadow_it->slabs_clsid].shadowq_hits++;
+
                 MEMCACHED_COMMAND_GET(c->sfd, key, nkey, -1, 0);
             }
 
@@ -5077,6 +5093,8 @@ int main (int argc, char **argv) {
         return EX_OSERR;
     }
 
+
+
     /* handle SIGINT and SIGTERM */
     signal(SIGINT, sig_handler);
     signal(SIGTERM, sig_handler);
@@ -5537,6 +5555,7 @@ int main (int argc, char **argv) {
     /* initialize other stuff */
     stats_init();
     assoc_init(settings.hashpower_init);
+    shadow_assoc_init(settings.hashpower_init);
     conn_init();
     slabs_init(settings.maxbytes, settings.factor, preallocate);
 
@@ -5557,6 +5576,10 @@ int main (int argc, char **argv) {
 
     if (settings.slab_reassign &&
         start_slab_maintenance_thread() == -1) {
+        exit(EXIT_FAILURE);
+    }
+
+    if (start_slab_rebalance_thread() == -1) {
         exit(EXIT_FAILURE);
     }
 
